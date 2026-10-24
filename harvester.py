@@ -1,11 +1,12 @@
-#!/usr/bin/env python3
 
 import asyncio
 import base64
 import json
+import os
 import re
 import socket
 import ssl
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -19,15 +20,25 @@ SOURCES_FILE = ROOT / "sources.txt"
 GEO_CACHE_FILE = ROOT / "geo_cache.json"
 
 # ---------------- настройки ----------------
-TCP_TIMEOUT = 2.5          # сек, таймаут TCP-подключения
-TLS_TIMEOUT = 4.0          # сек, таймаут TLS-рукопожатия
-CONCURRENCY = 500          # одновременных проверок
-TOP_N = 600                # размер top_600.txt
-FETCH_TIMEOUT = 30         # сек, скачивание подписки
+TCP_TIMEOUT = 2.5          # сек, этап 1
+TLS_TIMEOUT = 4.0          # сек, этап 2
+CONCURRENCY = 500          # одновременных проверок на этапах 1-2
+TOP_N = 600
+FETCH_TIMEOUT = 30
 REQUIRE_SECURITY = True    # отбрасывать ноды без tls/reality
-NUMBERED = True           # True -> «🇩🇪 Германия 2», «🇩🇪 Германия 3»...
+NUMBERED = False           # True -> «🇩🇪 Германия 2», «🇩🇪 Германия 3»...
 PLACEHOLDER_HOSTS = {"111.111.111.111", "0.0.0.0", "127.0.0.1", "localhost"}
 UA = "Mozilla/5.0 (harvester-py)"
+
+# этап 3 (xray)
+XRAY_BIN = os.environ.get("XRAY_BIN") or str(ROOT / "bin" / "xray")
+PROXY_BATCH = 100          # нод на один процесс xray
+PARALLEL_BATCHES = 3       # процессов xray одновременно
+PROXY_BASE_PORT = 20000
+PROXY_TIMEOUT = 8.0        # сек на один запрос через ноду
+CHECK_ROUNDS = 3           # нода должна ответить ВСЕ эти разы подряд
+TRACE_HOST = "1.1.1.1"
+TRACE_PATH = "/cdn-cgi/trace"
 
 COUNTRIES = {
     "RU": "Россия", "US": "США", "DE": "Германия", "NL": "Нидерланды",
@@ -41,12 +52,14 @@ COUNTRIES = {
     "BG": "Болгария", "RS": "Сербия", "HU": "Венгрия", "SK": "Словакия",
     "SI": "Словения", "HR": "Хорватия", "GR": "Греция", "TR": "Турция",
     "IL": "Израиль", "AE": "ОАЭ", "SA": "Саудовская Аравия", "IR": "Иран",
-    "IN": "Индия", "CN": "Китай", "HK": "Гонконг", "TW": "Тайвань",
-    "JP": "Япония", "KR": "Южная Корея", "SG": "Сингапур", "MY": "Малайзия",
-    "TH": "Таиланд", "VN": "Вьетнам", "ID": "Индонезия", "PH": "Филиппины",
-    "AU": "Австралия", "NZ": "Новая Зеландия", "CA": "Канада", "MX": "Мексика",
-    "BR": "Бразилия", "AR": "Аргентина", "CL": "Чили", "ZA": "ЮАР",
-    "EG": "Египет", "IS": "Исландия", "CY": "Кипр", "MT": "Мальта",
+    "IQ": "Ирак", "IN": "Индия", "CN": "Китай", "HK": "Гонконг",
+    "TW": "Тайвань", "JP": "Япония", "KR": "Южная Корея", "SG": "Сингапур",
+    "MY": "Малайзия", "TH": "Таиланд", "VN": "Вьетнам", "ID": "Индонезия",
+    "PH": "Филиппины", "AU": "Австралия", "NZ": "Новая Зеландия",
+    "CA": "Канада", "MX": "Мексика", "BR": "Бразилия", "AR": "Аргентина",
+    "CL": "Чили", "ZA": "ЮАР", "EG": "Египет", "IS": "Исландия",
+    "CY": "Кипр", "MT": "Мальта", "PK": "Пакистан", "BD": "Бангладеш",
+    "KG": "Киргизия", "MN": "Монголия", "NG": "Нигерия", "KE": "Кения",
 }
 
 
@@ -64,6 +77,8 @@ class Node:
     ip: str = ""
     tcp_ms: float | None = None
     tls_ms: float | None = None
+    proxy_ms: float | None = None
+    exit_cc: str = ""
     cc: str = ""
 
     @property
@@ -155,23 +170,19 @@ async def tcp_check(node: Node, sem: asyncio.Semaphore) -> None:
     async with sem:
         if not await resolve(node):
             return
-        best = None
-        for _ in range(1):  # одна попытка, второй этап перепроверит
-            t = time.perf_counter()
-            try:
-                _, w = await asyncio.wait_for(
-                    asyncio.open_connection(node.ip, node.port), TCP_TIMEOUT
-                )
-            except Exception:
-                continue
-            ms = (time.perf_counter() - t) * 1000
-            w.close()
-            try:
-                await w.wait_closed()
-            except Exception:
-                pass
-            best = ms if best is None else min(best, ms)
-        node.tcp_ms = best
+        t = time.perf_counter()
+        try:
+            _, w = await asyncio.wait_for(
+                asyncio.open_connection(node.ip, node.port), TCP_TIMEOUT
+            )
+        except Exception:
+            return
+        node.tcp_ms = (time.perf_counter() - t) * 1000
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
 
 
 # ---------------- этап 2: TLS-рукопожатие ----------------
@@ -208,6 +219,232 @@ async def tls_check(node: Node, sem: asyncio.Semaphore) -> None:
         node.tls_ms = best
 
 
+# ---------------- этап 3: реальная проверка через xray ----------------
+def build_outbound(n: Node, tag: str) -> dict | None:
+    """Строит outbound xray из параметров vless://. None = не поддерживается."""
+    p = n.params
+    net = p.get("type", "tcp").lower()
+    if net == "splithttp":
+        net = "xhttp"
+    if net not in ("tcp", "ws", "grpc", "httpupgrade", "xhttp"):
+        return None
+    if net == "tcp" and p.get("headerType", "none") not in ("none", ""):
+        return None
+
+    sec = p.get("security", "none").lower()
+    user = {"id": n.uuid, "encryption": p.get("encryption") or "none"}
+    if p.get("flow"):
+        user["flow"] = p["flow"]
+
+    ss: dict = {"network": net, "security": sec if sec in ("tls", "reality") else "none"}
+    if sec == "tls":
+        tls = {"serverName": p.get("sni") or p.get("host") or n.host,
+               "allowInsecure": True}
+        if p.get("fp"):
+            tls["fingerprint"] = p["fp"]
+        if p.get("alpn"):
+            tls["alpn"] = p["alpn"].split(",")
+        ss["tlsSettings"] = tls
+    elif sec == "reality":
+        ss["realitySettings"] = {
+            "serverName": p.get("sni") or n.host,
+            "fingerprint": p.get("fp") or "chrome",
+            "publicKey": p["pbk"],
+            "shortId": p.get("sid", ""),
+            "spiderX": p.get("spx", ""),
+        }
+
+    path = p.get("path") or "/"
+    host = p.get("host", "")
+    if net == "ws":
+        ss["wsSettings"] = {"path": path, "headers": {"Host": host} if host else {}}
+    elif net == "grpc":
+        ss["grpcSettings"] = {"serviceName": p.get("serviceName", ""),
+                              "multiMode": p.get("mode") == "multi"}
+    elif net == "httpupgrade":
+        ss["httpupgradeSettings"] = {"path": path, "host": host}
+    elif net == "xhttp":
+        ss["xhttpSettings"] = {"path": path, "host": host, "mode": p.get("mode", "auto")}
+
+    return {
+        "tag": tag,
+        "protocol": "vless",
+        "settings": {"vnext": [{"address": n.ip, "port": n.port, "users": [user]}]},
+        "streamSettings": ss,
+    }
+
+
+def xray_config(items: list[tuple[int, dict]]) -> dict:
+    return {
+        "log": {"loglevel": "none"},
+        "inbounds": [
+            {"tag": f"in{port}", "listen": "127.0.0.1", "port": port,
+             "protocol": "socks", "settings": {"auth": "noauth", "udp": False}}
+            for port, _ in items
+        ],
+        "outbounds": [ob for _, ob in items],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "inboundTag": [f"in{port}"], "outboundTag": ob["tag"]}
+                for port, ob in items
+            ],
+        },
+    }
+
+
+async def socks_get(port: int) -> str:
+    """HTTP GET http://1.1.1.1/cdn-cgi/trace через SOCKS5-inbound xray."""
+    r, w = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        w.write(b"\x05\x01\x00")
+        await w.drain()
+        if await r.readexactly(2) != b"\x05\x00":
+            raise OSError("socks auth")
+        w.write(b"\x05\x01\x00\x01" + socket.inet_aton(TRACE_HOST) + (80).to_bytes(2, "big"))
+        await w.drain()
+        head = await r.readexactly(4)
+        if head[1] != 0:
+            raise OSError("socks connect")
+        if head[3] == 1:
+            await r.readexactly(6)
+        elif head[3] == 4:
+            await r.readexactly(18)
+        else:
+            ln = (await r.readexactly(1))[0]
+            await r.readexactly(ln + 2)
+        w.write(
+            f"GET {TRACE_PATH} HTTP/1.1\r\nHost: {TRACE_HOST}\r\n"
+            f"User-Agent: curl/8.0\r\nConnection: close\r\n\r\n".encode()
+        )
+        await w.drain()
+        data = await r.read(-1)
+        return data.decode("utf-8", errors="ignore")
+    finally:
+        w.close()
+
+
+LOC_RE = re.compile(r"^loc=([A-Z]{2})", re.M)
+
+
+async def probe(port: int) -> tuple[bool, float, str]:
+    total, loc = 0.0, ""
+    for _ in range(CHECK_ROUNDS):
+        t = time.perf_counter()
+        try:
+            body = await asyncio.wait_for(socks_get(port), PROXY_TIMEOUT)
+        except Exception:
+            return False, 0.0, ""
+        m = LOC_RE.search(body)
+        if not m:
+            return False, 0.0, ""
+        total += (time.perf_counter() - t) * 1000
+        loc = m.group(1)
+    return True, total / CHECK_ROUNDS, loc
+
+
+async def wait_port(port: int, proc, timeout: float = 8.0) -> bool:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if proc.returncode is not None:
+            return False
+        try:
+            _, w = await asyncio.open_connection("127.0.0.1", port)
+            w.close()
+            await asyncio.sleep(0.3)
+            return True
+        except OSError:
+            await asyncio.sleep(0.2)
+    return False
+
+
+async def kill(proc) -> None:
+    if proc.returncode is None:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), 3)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+
+async def run_batch(batch: list[Node], base: int) -> None:
+    items: list[tuple[int, dict]] = []
+    owners: list[Node] = []
+    for n in batch:
+        port = base + len(items)
+        try:
+            ob = build_outbound(n, f"out{port}")
+        except Exception:
+            ob = None
+        if ob:
+            items.append((port, ob))
+            owners.append(n)
+    if not items:
+        return
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(xray_config(items), f)
+        cfg_path = f.name
+    proc = await asyncio.create_subprocess_exec(
+        XRAY_BIN, "run", "-c", cfg_path,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    started = False
+    try:
+        started = await wait_port(items[-1][0], proc)
+        if started:
+            results = await asyncio.gather(*(probe(port) for port, _ in items))
+            for n, (ok, ms, loc) in zip(owners, results):
+                if ok:
+                    n.proxy_ms, n.exit_cc = ms, loc
+    finally:
+        await kill(proc)
+        try:
+            os.unlink(cfg_path)
+        except OSError:
+            pass
+
+    # xray не стартовал (одна кривая нода ломает весь конфиг): делим пополам
+    if not started and len(owners) > 1:
+        half = len(owners) // 2
+        await run_batch(owners[:half], base)
+        await run_batch(owners[half:], base)
+
+
+async def proxy_stage(nodes: list[Node]) -> list[Node]:
+    if not Path(XRAY_BIN).exists():
+        log(f"  ! xray не найден ({XRAY_BIN}): этап 3 пропущен, "
+            f"результат будет менее точным")
+        for n in nodes:
+            n.proxy_ms, n.exit_cc = n.tls_ms, n.cc
+        return nodes
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for i in range(0, len(nodes), PROXY_BATCH):
+        queue.put_nowait(nodes[i:i + PROXY_BATCH])
+    total = queue.qsize()
+    done = 0
+
+    async def worker(k: int) -> None:
+        nonlocal done
+        base = PROXY_BASE_PORT + k * PROXY_BATCH
+        while True:
+            try:
+                batch = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            await run_batch(batch, base)
+            done += 1
+            log(f"  пачка {done}/{total}")
+
+    await asyncio.gather(*(worker(k) for k in range(PARALLEL_BATCHES)))
+    return [n for n in nodes if n.proxy_ms is not None]
+
+
 # ---------------- страна и название ----------------
 def load_geo_cache() -> dict:
     if GEO_CACHE_FILE.exists():
@@ -219,7 +456,7 @@ def load_geo_cache() -> dict:
 
 
 def geo_lookup(ips: list[str], cache: dict) -> None:
-    """ip-api.com (бесплатно, HTTP, лимит ~15 batch-запросов в минуту)."""
+    """ip-api.com (бесплатно, HTTP). Нужен только для ping_tested.txt."""
     todo = [ip for ip in dict.fromkeys(ips) if ip not in cache]
     log(f"GeoIP: {len(todo)} новых IP")
     for i in range(0, len(todo), 100):
@@ -233,7 +470,6 @@ def geo_lookup(ips: list[str], cache: dict) -> None:
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = json.load(r)
-                # ждём только когда лимит реально исчерпан
                 if r.headers.get("X-Rl") == "0":
                     wait = float(r.headers.get("X-Ttl", "60")) + 1
             for item in data:
@@ -305,20 +541,26 @@ async def run() -> None:
 
     log("Этап 2: TLS-рукопожатие")
     await asyncio.gather(*(tls_check(n, sem) for n in alive))
-    good = sorted((n for n in alive if n.tls_ms is not None),
-                  key=lambda n: n.tls_ms)
-    log(f"Прошли этап 2: {len(good)}")
+    tls_ok = [n for n in alive if n.tls_ms is not None]
+    log(f"Прошли этап 2: {len(tls_ok)}")
 
     cache = load_geo_cache()
     geo_lookup([n.ip for n in alive], cache)
     for n in alive:
         n.cc = (cache.get(n.ip) or "").upper()
 
+    log("Этап 3: реальная проверка через xray")
+    final = await proxy_stage(tls_ok)
+    for n in final:
+        n.cc = (n.exit_cc or n.cc).upper()   # страна ВЫХОДА, а не входа
+    final.sort(key=lambda n: n.proxy_ms)
+    log(f"Прошли этап 3: {len(final)}")
+
     log("Запись файлов")
     write("ping_tested.txt", alive)
-    write("speed_tested.txt", good)
-    write("top_600.txt", good[:TOP_N])
-    write("non_ru.txt", [n for n in good if n.cc != "RU"])
+    write("speed_tested.txt", final)
+    write("top_600.txt", final[:TOP_N])
+    write("non_ru.txt", [n for n in final if n.cc != "RU"])
 
 
 if __name__ == "__main__":
