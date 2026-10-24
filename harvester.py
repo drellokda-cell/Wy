@@ -19,13 +19,13 @@ SOURCES_FILE = ROOT / "sources.txt"
 GEO_CACHE_FILE = ROOT / "geo_cache.json"
 
 # ---------------- настройки ----------------
-TCP_TIMEOUT = 4.0          # сек, таймаут TCP-подключения
-TLS_TIMEOUT = 6.0          # сек, таймаут TLS-рукопожатия
-CONCURRENCY = 300          # одновременных проверок
+TCP_TIMEOUT = 2.5          # сек, таймаут TCP-подключения
+TLS_TIMEOUT = 4.0          # сек, таймаут TLS-рукопожатия
+CONCURRENCY = 500          # одновременных проверок
 TOP_N = 600                # размер top_600.txt
 FETCH_TIMEOUT = 30         # сек, скачивание подписки
 REQUIRE_SECURITY = True    # отбрасывать ноды без tls/reality
-NUMBERED = False           # True -> «🇩🇪 Германия 2», «🇩🇪 Германия 3»...
+NUMBERED = True           # True -> «🇩🇪 Германия 2», «🇩🇪 Германия 3»...
 PLACEHOLDER_HOSTS = {"111.111.111.111", "0.0.0.0", "127.0.0.1", "localhost"}
 UA = "Mozilla/5.0 (harvester-py)"
 
@@ -156,7 +156,7 @@ async def tcp_check(node: Node, sem: asyncio.Semaphore) -> None:
         if not await resolve(node):
             return
         best = None
-        for _ in range(2):  # две попытки, берём лучшую
+        for _ in range(1):  # одна попытка, второй этап перепроверит
             t = time.perf_counter()
             try:
                 _, w = await asyncio.wait_for(
@@ -229,15 +229,21 @@ def geo_lookup(ips: list[str], cache: dict) -> None:
             data=json.dumps(chunk).encode(),
             headers={"Content-Type": "application/json", "User-Agent": UA},
         )
+        wait = 0.0
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = json.load(r)
+                # ждём только когда лимит реально исчерпан
+                if r.headers.get("X-Rl") == "0":
+                    wait = float(r.headers.get("X-Ttl", "60")) + 1
             for item in data:
                 ok = item.get("status") == "success"
                 cache[item["query"]] = item.get("countryCode", "") if ok else ""
         except Exception as e:
             log(f"  ! GeoIP ошибка: {e}")
-        time.sleep(4.5)
+            wait = 5.0
+        if wait and i + 100 < len(todo):
+            time.sleep(wait)
     GEO_CACHE_FILE.write_text(json.dumps(cache), encoding="utf-8")
 
 
