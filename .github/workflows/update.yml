@@ -11,13 +11,21 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install xray
+        run: |
+          mkdir -p bin
+          curl -fsSL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q -o xray.zip xray -d bin
+          chmod +x bin/xray
+          ./bin/xray version | head -n 1
 
       - name: Build lists
         run: python harvester.py
@@ -26,6 +34,6 @@ jobs:
         run: |
           git config user.name "harvester-bot"
           git config user.email "harvester-bot@users.noreply.github.com"
-          git add -A
+          git add ping_tested.txt speed_tested.txt top_600.txt non_ru.txt geo_cache.json
           git diff --cached --quiet || git commit -m "update lists"
           git push
