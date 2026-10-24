@@ -1,4 +1,24 @@
+#!/usr/bin/env python3
+"""
+Harvester (Python), версия 2.
 
+Собирает VLESS-конфиги из публичных подписок и проверяет их в три этапа:
+  1. разбор URI + TCP-проверка порта
+  2. TLS-рукопожатие с SNI
+  3. РЕАЛЬНАЯ проверка: через ядро xray поднимается соединение через ноду,
+     делается 3 запроса подряд к 1.1.1.1/cdn-cgi/trace. Нода должна ответить
+     на все три (отсекает «работает через раз»). Из ответа берётся страна
+     ВЫХОДНОГО IP, а не страна входного сервера.
+
+Итоговые файлы (названия вида «🇩🇪 Германия»):
+    ping_tested.txt   прошли этап 1
+    speed_tested.txt  прошли все три этапа, по возрастанию задержки
+    top_600.txt       первые TOP_N из speed_tested
+    non_ru.txt        speed_tested без России
+
+Нужен бинарник xray (путь в XRAY_BIN или ./bin/xray). Если его нет,
+этап 3 пропускается с предупреждением. Остальное: только стандартная библиотека.
+"""
 import asyncio
 import base64
 import json
@@ -37,8 +57,11 @@ PARALLEL_BATCHES = 3       # процессов xray одновременно
 PROXY_BASE_PORT = 20000
 PROXY_TIMEOUT = 8.0        # сек на один запрос через ноду
 CHECK_ROUNDS = 3           # нода должна ответить ВСЕ эти разы подряд
-TRACE_HOST = "1.1.1.1"
+CHECK_HOST = "connectivitycheck.gstatic.com"   # проверка «нода реально пропускает трафик»
+CHECK_PATH = "/generate_204"
+TRACE_HOST = "1.1.1.1"                         # только для определения страны выхода
 TRACE_PATH = "/cdn-cgi/trace"
+ALLOW_INSECURE = False     # True = принимать самоподписанные сертификаты (нужно не всем xray)
 
 COUNTRIES = {
     "RU": "Россия", "US": "США", "DE": "Германия", "NL": "Нидерланды",
@@ -238,8 +261,9 @@ def build_outbound(n: Node, tag: str) -> dict | None:
 
     ss: dict = {"network": net, "security": sec if sec in ("tls", "reality") else "none"}
     if sec == "tls":
-        tls = {"serverName": p.get("sni") or p.get("host") or n.host,
-               "allowInsecure": True}
+        tls = {"serverName": p.get("sni") or p.get("host") or n.host}
+        if ALLOW_INSECURE:
+            tls["allowInsecure"] = True
         if p.get("fp"):
             tls["fingerprint"] = p["fp"]
         if p.get("alpn"):
@@ -293,15 +317,20 @@ def xray_config(items: list[tuple[int, dict]]) -> dict:
     }
 
 
-async def socks_get(port: int) -> str:
-    """HTTP GET http://1.1.1.1/cdn-cgi/trace через SOCKS5-inbound xray."""
+async def socks_get(port: int, host: str, path: str) -> str:
+    """HTTP GET http://host/path через SOCKS5-inbound xray."""
     r, w = await asyncio.open_connection("127.0.0.1", port)
     try:
         w.write(b"\x05\x01\x00")
         await w.drain()
         if await r.readexactly(2) != b"\x05\x00":
             raise OSError("socks auth")
-        w.write(b"\x05\x01\x00\x01" + socket.inet_aton(TRACE_HOST) + (80).to_bytes(2, "big"))
+        try:
+            target = b"\x01" + socket.inet_aton(host)
+        except OSError:
+            hb = host.encode()
+            target = b"\x03" + bytes([len(hb)]) + hb
+        w.write(b"\x05\x01\x00" + target + (80).to_bytes(2, "big"))
         await w.drain()
         head = await r.readexactly(4)
         if head[1] != 0:
@@ -314,7 +343,7 @@ async def socks_get(port: int) -> str:
             ln = (await r.readexactly(1))[0]
             await r.readexactly(ln + 2)
         w.write(
-            f"GET {TRACE_PATH} HTTP/1.1\r\nHost: {TRACE_HOST}\r\n"
+            f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
             f"User-Agent: curl/8.0\r\nConnection: close\r\n\r\n".encode()
         )
         await w.drain()
@@ -328,18 +357,30 @@ LOC_RE = re.compile(r"^loc=([A-Z]{2})", re.M)
 
 
 async def probe(port: int) -> tuple[bool, float, str]:
-    total, loc = 0.0, ""
+    total = 0.0
     for _ in range(CHECK_ROUNDS):
         t = time.perf_counter()
         try:
-            body = await asyncio.wait_for(socks_get(port), PROXY_TIMEOUT)
+            body = await asyncio.wait_for(
+                socks_get(port, CHECK_HOST, CHECK_PATH), PROXY_TIMEOUT
+            )
         except Exception:
             return False, 0.0, ""
-        m = LOC_RE.search(body)
-        if not m:
+        if not body.startswith("HTTP/1.1 204") and not body.startswith("HTTP/1.0 204"):
             return False, 0.0, ""
         total += (time.perf_counter() - t) * 1000
-        loc = m.group(1)
+
+    # страна выходного IP: необязательно, при неудаче останется страна входа
+    loc = ""
+    try:
+        body = await asyncio.wait_for(
+            socks_get(port, TRACE_HOST, TRACE_PATH), PROXY_TIMEOUT
+        )
+        m = LOC_RE.search(body)
+        if m:
+            loc = m.group(1)
+    except Exception:
+        pass
     return True, total / CHECK_ROUNDS, loc
 
 
@@ -391,16 +432,26 @@ async def run_batch(batch: list[Node], base: int) -> None:
         cfg_path = f.name
     proc = await asyncio.create_subprocess_exec(
         XRAY_BIN, "run", "-c", cfg_path,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )
     started = False
     try:
         started = await wait_port(items[-1][0], proc)
         if started:
             results = await asyncio.gather(*(probe(port) for port, _ in items))
+            alive_cnt = 0
             for n, (ok, ms, loc) in zip(owners, results):
                 if ok:
                     n.proxy_ms, n.exit_cc = ms, loc
+                    alive_cnt += 1
+            log(f"    xray ок: нод {len(items)}, рабочих {alive_cnt}")
+        elif proc.returncode is not None:
+            try:
+                err = (await asyncio.wait_for(proc.stderr.read(), 2)).decode(
+                    "utf-8", errors="ignore").strip()
+            except Exception:
+                err = ""
+            log(f"    ! xray не стартовал на {len(items)} нодах: {err[:300] or 'без текста ошибки'}")
     finally:
         await kill(proc)
         try:
@@ -509,6 +560,9 @@ def render(nodes: list[Node]) -> str:
 
 
 def write(name: str, nodes: list[Node]) -> None:
+    if not nodes and (ROOT / name).exists():
+        log(f"  {name}: пусто, старый файл оставлен без изменений")
+        return
     (ROOT / name).write_text(render(nodes), encoding="utf-8")
     log(f"  {name}: {len(nodes)}")
 
