@@ -1,2 +1,10 @@
+# Источники VLESS-подписок (по одному URL в строке, # = комментарий).
+# Те же, что в 1.yaml у luxxuria/harvester:
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt
 https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt
+
+# Дополнительно: «чёрные» списки igareck (для обычного интернета, больше зарубежных серверов).
+# Имя BLACK_VLESS_RUS_mobile.txt взято из его README; если файл не найдётся,
+# в логе будет «не скачалось», остальное продолжит работать.
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
