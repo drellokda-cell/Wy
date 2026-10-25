@@ -1,10 +1,26 @@
 # Источники VLESS-подписок (по одному URL в строке, # = комментарий).
-# Те же, что в 1.yaml у luxxuria/harvester:
-https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt
-https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt
+# Если URL не скачался, в логе будет «не скачалось», остальное продолжит работать.
 
-# Дополнительно: «чёрные» списки igareck (для обычного интернета, больше зарубежных серверов).
-# Имя BLACK_VLESS_RUS_mobile.txt взято из его README; если файл не найдётся,
-# в логе будет «не скачалось», остальное продолжит работать.
+# --- Глобальный агрегатор rtwo2/FastNodes (не привязан к России) ---
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/verified.txt
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/top.txt
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/protocols/vless.txt
+# Списки по странам (код страны в имени файла; несуществующие просто пропустятся)
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/DE.txt
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/NL.txt
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/FI.txt
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/SE.txt
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/US.txt
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/GB.txt
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/FR.txt
+https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/PL.txt
+
+# --- Списки igareck (ориентированы на Россию, «чёрные» = обычный интернет) ---
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
+
+# --- Из 1.yaml у luxxuria/harvester ---
+https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt
+
+# Отключено, чтобы не тащить много русских серверов (раскомментируй, если нужны):
+# https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-CIDR-RU-all.txt
