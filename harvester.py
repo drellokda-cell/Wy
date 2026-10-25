@@ -57,10 +57,20 @@ PARALLEL_BATCHES = 3       # процессов xray одновременно
 PROXY_BASE_PORT = 20000
 PROXY_TIMEOUT = 8.0        # сек на один запрос через ноду
 CHECK_ROUNDS = 3           # нода должна ответить ВСЕ эти разы подряд
-CHECK_HOST = "connectivitycheck.gstatic.com"   # проверка «нода реально пропускает трафик»
-CHECK_PATH = "/generate_204"
-TRACE_HOST = "1.1.1.1"                         # только для определения страны выхода
-TRACE_PATH = "/cdn-cgi/trace"
+# проверка «нода реально пропускает трафик»: запросы по кругу к разным хостам
+CHECK_URLS = [
+    ("connectivitycheck.gstatic.com", "/generate_204"),
+    ("cp.cloudflare.com", "/generate_204"),
+]
+MAX_PROXY_MS = 3000        # средняя задержка выше этого = нода отсеивается
+RECHECK_PASSES = 2         # сколько полных проходов этапа 3 (нода должна пройти все)
+RECHECK_DELAY = 20         # сек паузы между проходами (ловит «работает через раз»)
+# определение страны выходного IP: (хост, путь, регулярка); пробуются по очереди
+GEO_ENDPOINTS = [
+    ("ip-api.com", "/json/?fields=status,countryCode",
+     re.compile(r'"countryCode"\s*:\s*"([A-Z]{2})"')),
+    ("ipinfo.io", "/country", re.compile(r"^([A-Z]{2})\s*$", re.M)),
+]
 ALLOW_INSECURE = False     # True = принимать самоподписанные сертификаты (нужно не всем xray)
 
 COUNTRIES = {
@@ -358,30 +368,39 @@ LOC_RE = re.compile(r"^loc=([A-Z]{2})", re.M)
 
 async def probe(port: int) -> tuple[bool, float, str]:
     total = 0.0
-    for _ in range(CHECK_ROUNDS):
+    for i in range(CHECK_ROUNDS):
+        host, path = CHECK_URLS[i % len(CHECK_URLS)]
         t = time.perf_counter()
         try:
-            body = await asyncio.wait_for(
-                socks_get(port, CHECK_HOST, CHECK_PATH), PROXY_TIMEOUT
-            )
+            body = await asyncio.wait_for(socks_get(port, host, path), PROXY_TIMEOUT)
         except Exception:
             return False, 0.0, ""
         if not body.startswith("HTTP/1.1 204") and not body.startswith("HTTP/1.0 204"):
             return False, 0.0, ""
         total += (time.perf_counter() - t) * 1000
+        if i + 1 < CHECK_ROUNDS:
+            await asyncio.sleep(1.5)   # пауза между запросами, чтобы не пройти «на удачу»
+    if total / CHECK_ROUNDS > MAX_PROXY_MS:
+        return False, 0.0, ""
 
-    # страна выходного IP: необязательно, при неудаче останется страна входа
-    loc = ""
-    try:
-        body = await asyncio.wait_for(
-            socks_get(port, TRACE_HOST, TRACE_PATH), PROXY_TIMEOUT
-        )
-        m = LOC_RE.search(body)
-        if m:
-            loc = m.group(1)
-    except Exception:
-        pass
+    # страна ВЫХОДНОГО IP: запрос к гео-сервису идёт через ноду, поэтому сервис
+    # видит IP, с которого нода выходит в интернет. Без страны нода отбрасывается.
+    loc = await exit_country(port)
+    if not loc:
+        return False, 0.0, ""
     return True, total / CHECK_ROUNDS, loc
+
+
+async def exit_country(port: int) -> str:
+    for host, path, rx in GEO_ENDPOINTS:
+        try:
+            body = await asyncio.wait_for(socks_get(port, host, path), PROXY_TIMEOUT)
+        except Exception:
+            continue
+        m = rx.search(body)
+        if m:
+            return m.group(1)
+    return ""
 
 
 async def wait_port(port: int, proc, timeout: float = 8.0) -> bool:
@@ -442,7 +461,8 @@ async def run_batch(batch: list[Node], base: int) -> None:
             alive_cnt = 0
             for n, (ok, ms, loc) in zip(owners, results):
                 if ok:
-                    n.proxy_ms, n.exit_cc = ms, loc
+                    n.proxy_ms = ms
+                    n.exit_cc = loc or n.exit_cc
                     alive_cnt += 1
             log(f"    xray ок: нод {len(items)}, рабочих {alive_cnt}")
         elif proc.returncode is not None:
@@ -604,7 +624,18 @@ async def run() -> None:
         n.cc = (cache.get(n.ip) or "").upper()
 
     log("Этап 3: реальная проверка через xray")
-    final = await proxy_stage(tls_ok)
+    final = tls_ok
+    for p in range(RECHECK_PASSES):
+        if p:
+            log(f"  пауза {RECHECK_DELAY} с перед проходом {p + 1}")
+            await asyncio.sleep(RECHECK_DELAY)
+        for n in final:
+            n.proxy_ms = None
+        log(f"  проход {p + 1}/{RECHECK_PASSES}: нод {len(final)}")
+        final = await proxy_stage(final)
+        log(f"  после прохода {p + 1}: {len(final)}")
+        if not final:
+            break
     for n in final:
         n.cc = (n.exit_cc or n.cc).upper()   # страна ВЫХОДА, а не входа
     final.sort(key=lambda n: n.proxy_ms)
